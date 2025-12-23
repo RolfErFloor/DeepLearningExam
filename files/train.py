@@ -14,6 +14,7 @@ import math
 import config
 from tensorflow.keras.optimizers import Adam
 import matplotlib.pyplot as plt
+import time
 
 if __name__ == "__main__":
     data_path = config.PROJECT['data_path']
@@ -27,26 +28,37 @@ if __name__ == "__main__":
     lr_choices = search_cfg.get('learning_rate', [config.DEFAULTS['learning_rate']])
     search_epochs = search_cfg.get('search_epochs', 10)
 
-    best_val_loss = float('inf')
+    best_val_score = float('-inf')
     best_params = {'batch_size': config.DEFAULTS['batch_size'], 'learning_rate': config.DEFAULTS['learning_rate']}
     search_results = []
 
-    # Hyperparameter search (short runs)
+    monitor_metric = 'val_soft_iou' 
+
+    # Hyperparameter search 
+    total_trials = len(bs_choices) * len(lr_choices)
+    trial_idx = 0
     for bs, lr in itertools.product(bs_choices, lr_choices):
-        print(f"\nStarting search trial: batch_size={bs}, learning_rate={lr}")
-        train_dataset = dataset(train_images, train_masks, batch_size=bs)
-        val_dataset   = dataset(val_images, val_masks, batch_size=bs)
+        trial_idx += 1
+        print(f"\nStarting search trial {trial_idx}/{total_trials}: batch_size={bs}, learning_rate={lr}")
+        start_time = time.time()
+        train_dataset = dataset(train_images, train_masks, batch_size=bs, augment=True)
+        val_dataset   = dataset(val_images, val_masks, batch_size=bs, augment=False)
 
         model = build_model()
-        model.compile(optimizer=Adam(learning_rate=lr), loss=config.DEFAULTS['loss'], metrics=config.DEFAULTS['metrics'])
+        model.compile(
+                optimizer=Adam(learning_rate=lr, clipnorm=1.0),
+                loss=config.DEFAULTS['loss'],
+                metrics=config.DEFAULTS['metrics']
+            )
 
-        steps_per_epoch = max(1, math.floor(len(train_images) / bs))
-        validation_steps = max(1, math.floor(len(val_images) / bs))
+
+        steps_per_epoch = max(1, math.ceil(len(train_images) / bs))
+        validation_steps = max(1, math.ceil(len(val_images) / bs))
 
         ckpt_name = config.PROJECT['search_checkpoint_template'].format(bs=bs, lr=lr)
-        checkpoint = ModelCheckpoint(ckpt_name, monitor='val_loss', save_best_only=True, verbose=1)
-        earlystop  = EarlyStopping(monitor='val_loss', patience=5, verbose=1)
-        reducelr   = ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=3, verbose=1)
+        checkpoint = ModelCheckpoint(ckpt_name, monitor=monitor_metric, save_best_only=True, verbose=1, mode='max')
+        earlystop  = EarlyStopping(monitor=monitor_metric, patience=5, verbose=1, mode='max')
+        reducelr   = ReduceLROnPlateau(monitor=monitor_metric, factor=0.1, patience=3, verbose=1, mode='max')
 
         history = model.fit(train_dataset,
                             epochs=search_epochs,
@@ -56,47 +68,38 @@ if __name__ == "__main__":
                             callbacks=[checkpoint, earlystop, reducelr],
                             verbose=2)
 
-        trial_best = min(history.history.get('val_loss', [float('inf')]))
-        print(f"Trial finished: val_loss={trial_best}")
-        search_results.append({'batch_size': bs, 'learning_rate': lr, 'val_loss': trial_best})
-        if trial_best < best_val_loss:
-            best_val_loss = trial_best
+        trial_score = max(history.history.get('val_accuracy', [0.0]))
+        duration = time.time() - start_time
+        percent = (trial_idx / total_trials) * 100.0
+        print(f"Trial finished: val_accuracy={trial_score:.4f} (duration {duration:.1f}s). Progress: {trial_idx}/{total_trials} ({percent:.1f}%).")
+        search_results.append({'batch_size': bs, 'learning_rate': lr, 'val_accuracy': trial_score})
+        if trial_score > best_val_score:
+            best_val_score = trial_score
             best_params = {'batch_size': bs, 'learning_rate': lr}
+            print(f"New best params: {best_params} with val_accuracy={best_val_score:.4f}")
 
-    print(f"\nBest hyperparameters found: {best_params}, val_loss={best_val_loss}")
+    print(f"\nBest hyperparameters found: {best_params}, val_accuracy={best_val_score}")
 
-    # Plot hyperparameter search results
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for result in search_results:
-        label = f"BS={result['batch_size']}, LR={result['learning_rate']:.0e}"
-        ax.bar(label, result['val_loss'], alpha=0.7)
-    ax.set_ylabel('Validation Loss')
-    ax.set_title('Hyperparameter Search Results')
-    ax.set_xlabel('Batch Size & Learning Rate')
-    plt.xticks(rotation=45, ha='right')
-    plt.tight_layout()
-    plt.savefig('hyperparam_search_results.png', dpi=150)
-    print("Saved plot: hyperparam_search_results.png")
-    plt.close()
 
     # Continue training with best hyperparameters for full epochs
     final_bs = best_params['batch_size']
     final_lr = best_params['learning_rate']
 
-    train_dataset = dataset(train_images, train_masks, batch_size=final_bs)
-    val_dataset   = dataset(val_images, val_masks, batch_size=final_bs)
+    train_dataset = dataset(train_images, train_masks, batch_size=final_bs, augment=True)
+    val_dataset   = dataset(val_images, val_masks, batch_size=final_bs, augment=False)
 
     model = build_model()
     model.compile(optimizer=Adam(learning_rate=final_lr), loss=config.DEFAULTS['loss'], metrics=config.DEFAULTS['metrics'])
 
-    checkpoint = ModelCheckpoint(config.PROJECT['model_checkpoint'], monitor='val_loss', save_best_only=True, verbose=1)
-    earlystop  = EarlyStopping(monitor='val_loss', patience=10, verbose=1)
-    reducelr   = ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=5, verbose=1)
+    checkpoint = ModelCheckpoint(config.PROJECT['model_checkpoint'], monitor=monitor_metric, save_best_only=True, verbose=1, mode='max')
+    earlystop  = EarlyStopping(monitor=monitor_metric, patience=10, verbose=1, mode='max')
+    reducelr   = ReduceLROnPlateau(monitor=monitor_metric, factor=0.1, patience=5, verbose=1, mode='max')
     csvlogger  = CSVLogger(config.PROJECT['log_csv'], append=False)
     tensorboard= TensorBoard(log_dir='./logs')
 
-    steps_per_epoch = max(1, math.floor(len(train_images) / final_bs))
-    validation_steps = max(1, math.floor(len(val_images) / final_bs))
+    steps_per_epoch = max(1, math.ceil(len(train_images) / final_bs))
+    validation_steps = max(1, math.ceil(len(val_images) / final_bs))
+
 
     final_history = model.fit(train_dataset,
                               epochs=config.DEFAULTS['full_epochs'],
@@ -105,25 +108,40 @@ if __name__ == "__main__":
                               validation_steps=validation_steps,
                               callbacks=[checkpoint, earlystop, reducelr, csvlogger, tensorboard])
 
-    # Plot final training history
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    
-    axes[0].plot(final_history.history['loss'], label='Training Loss', linewidth=2)
-    axes[0].plot(final_history.history['val_loss'], label='Validation Loss', linewidth=2)
-    axes[0].set_xlabel('Epoch')
-    axes[0].set_ylabel('Loss')
-    axes[0].set_title('Training vs Validation Loss')
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
-    
-    axes[1].plot(final_history.history['accuracy'], label='Training Accuracy', linewidth=2)
-    axes[1].plot(final_history.history['val_accuracy'], label='Validation Accuracy', linewidth=2)
-    axes[1].set_xlabel('Epoch')
-    axes[1].set_ylabel('Accuracy')
-    axes[1].set_title('Training vs Validation Accuracy')
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
-    
+    # Plot final training history for requested metrics
+
+    metrics_to_plot = ['loss', 'accuracy', 'recall', 'precision', 'iou']
+    n = len(metrics_to_plot)
+    fig, axes = plt.subplots(2, n, figsize=(5 * n, 8))
+
+    # Top row: training metrics
+    for i, m in enumerate(metrics_to_plot):
+        ax = axes[0, i]
+        train_key = m
+        train_vals = final_history.history.get(train_key, None)
+
+        if train_vals is not None:
+            ax.plot(train_vals, linewidth=2.5, color='#1f77b4')
+        
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel(m.capitalize())
+        ax.set_title(f'Training {m.capitalize()}')
+        ax.grid(True, alpha=0.3)
+
+    # Bottom row: validation metrics
+    for i, m in enumerate(metrics_to_plot):
+        ax = axes[1, i]
+        val_key = 'val_' + m
+        val_vals = final_history.history.get(val_key, None)
+
+        if val_vals is not None:
+            ax.plot(val_vals, linewidth=2.5, color='#ff7f0e')
+        
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel(m.capitalize())
+        ax.set_title(f'Validation {m.capitalize()}')
+        ax.grid(True, alpha=0.3)
+
     plt.tight_layout()
     plt.savefig('training_history.png', dpi=150)
     print("Saved plot: training_history.png")

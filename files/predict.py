@@ -40,6 +40,19 @@ if __name__ == "__main__":
     project_root = os.path.abspath(os.path.join(script_dir, ".."))    # .../DeepLearningExam
     dataset_dir = os.path.join(project_root, data_path)               # .../DeepLearningExam/CVC-ClinicDB
 
+    # Resolve model checkpoint relative to project root and provide .h5
+    # fallback if the configured file isn't present.
+    if not os.path.isabs(model_checkpoint):
+        model_checkpoint = os.path.join(project_root, model_checkpoint)
+
+    if not os.path.exists(model_checkpoint):
+        alternative = os.path.splitext(model_checkpoint)[0] + '.h5'
+        if os.path.exists(alternative):
+            model_checkpoint = alternative
+
+    if not os.path.exists(model_checkpoint):
+        raise FileNotFoundError(f"Model checkpoint not found: {model_checkpoint}")
+
     test_image_paths = sorted(glob.glob(os.path.join(dataset_dir, "Original", "*.tif")))
     if len(test_image_paths) == 0:
         raise ValueError(f"No .tif files found in: {os.path.join(dataset_dir, 'Original')}")
